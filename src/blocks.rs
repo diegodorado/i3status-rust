@@ -20,6 +20,7 @@ pub mod nvidia_gpu;
 pub mod pacman;
 pub mod pomodoro;
 pub mod sound;
+pub mod jack;
 pub mod speedtest;
 pub mod temperature;
 pub mod template;
@@ -50,6 +51,7 @@ use self::notmuch::*;
 use self::nvidia_gpu::*;
 use self::pacman::*;
 use self::pomodoro::*;
+use self::jack::*;
 use self::sound::*;
 use self::speedtest::*;
 use self::temperature::*;
@@ -142,6 +144,7 @@ pub fn create_block(
         "nvidia_gpu" => block!(NvidiaGpu, block_config, config, update_request),
         "pacman" => block!(Pacman, block_config, config, update_request),
         "pomodoro" => block!(Pomodoro, block_config, config, update_request),
+        "jack" => block!(Jack, block_config, config, update_request),
         "sound" => block!(Sound, block_config, config, update_request),
         "speedtest" => block!(SpeedTest, block_config, config, update_request),
         "temperature" => block!(Temperature, block_config, config, update_request),
