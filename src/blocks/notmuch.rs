@@ -1,17 +1,17 @@
+use std::collections::BTreeMap;
 use std::env;
 use std::time::Duration;
 
 use crossbeam_channel::Sender;
-use notmuch;
 use serde_derive::Deserialize;
-use uuid::Uuid;
 
-use crate::blocks::{Block, ConfigBlock};
+use crate::blocks::{Block, ConfigBlock, Update};
 use crate::config::Config;
 use crate::de::deserialize_duration;
 use crate::errors::*;
 use crate::input::{I3BarEvent, MouseButton};
 use crate::scheduler::Task;
+use crate::util::pseudo_uuid;
 use crate::widget::{I3BarWidget, State};
 use crate::widgets::text::TextWidget;
 
@@ -53,6 +53,9 @@ pub struct NotmuchConfig {
     pub name: Option<String>,
     #[serde(default = "NotmuchConfig::default_no_icon")]
     pub no_icon: bool,
+
+    #[serde(default = "NotmuchConfig::default_color_overrides")]
+    pub color_overrides: Option<BTreeMap<String, String>>,
 }
 
 impl NotmuchConfig {
@@ -93,13 +96,18 @@ impl NotmuchConfig {
     fn default_name() -> Option<String> {
         None
     }
+
     fn default_no_icon() -> bool {
         false
     }
+
+    fn default_color_overrides() -> Option<BTreeMap<String, String>> {
+        None
+    }
 }
 
-fn run_query(db_path: &String, query_string: &String) -> std::result::Result<u32, notmuch::Error> {
-    let db = notmuch::Database::open(db_path, notmuch::DatabaseMode::ReadOnly)?;
+fn run_query(db_path: &str, query_string: &str) -> std::result::Result<u32, notmuch::Error> {
+    let db = notmuch::Database::open(&db_path, notmuch::DatabaseMode::ReadOnly)?;
     let query = db.create_query(query_string)?;
     Ok(query.count_messages()?)
 }
@@ -112,12 +120,12 @@ impl ConfigBlock for Notmuch {
         config: Config,
         _tx_update_request: Sender<Task>,
     ) -> Result<Self> {
-        let mut widget = TextWidget::new(config.clone());
+        let mut widget = TextWidget::new(config);
         if !block_config.no_icon {
             widget.set_icon("mail");
         }
         Ok(Notmuch {
-            id: Uuid::new_v4().to_simple().to_string(),
+            id: pseudo_uuid().to_string(),
             update_interval: block_config.interval,
             db: block_config.maildir,
             query: block_config.query,
@@ -126,7 +134,6 @@ impl ConfigBlock for Notmuch {
             threshold_warning: block_config.threshold_warning,
             threshold_critical: block_config.threshold_critical,
             name: block_config.name,
-
             text: widget,
         })
     }
@@ -142,27 +149,27 @@ impl Notmuch {
     }
 
     fn update_state(&mut self, count: u32) {
-        let mut state = { State::Idle };
+        let mut state = State::Idle;
         if count >= self.threshold_critical {
-            state = { State::Critical };
+            state = State::Critical;
         } else if count >= self.threshold_warning {
-            state = { State::Warning };
+            state = State::Warning;
         } else if count >= self.threshold_good {
-            state = { State::Good };
+            state = State::Good;
         } else if count >= self.threshold_info {
-            state = { State::Info };
+            state = State::Info;
         }
         self.text.set_state(state);
     }
 }
 
 impl Block for Notmuch {
-    fn update(&mut self) -> Result<Option<Duration>> {
+    fn update(&mut self) -> Result<Option<Update>> {
         match run_query(&self.db, &self.query) {
             Ok(count) => {
                 self.update_text(count);
                 self.update_state(count);
-                Ok(Some(self.update_interval))
+                Ok(Some(self.update_interval.into()))
             }
             Err(e) => Err(BlockError("notmuch".to_string(), e.to_string())),
         }

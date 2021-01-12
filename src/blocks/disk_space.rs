@@ -1,20 +1,19 @@
-use crate::scheduler::Task;
-use crossbeam_channel::Sender;
-use serde_derive::Deserialize;
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::time::Duration;
 
-use crate::blocks::{Block, ConfigBlock};
+use crossbeam_channel::Sender;
+use nix::sys::statvfs::statvfs;
+use serde_derive::Deserialize;
+
+use crate::blocks::{Block, ConfigBlock, Update};
 use crate::config::Config;
 use crate::de::deserialize_duration;
 use crate::errors::*;
-use crate::util::format_percent_bar;
+use crate::scheduler::Task;
+use crate::util::{format_percent_bar, pseudo_uuid, FormatTemplate};
 use crate::widget::{I3BarWidget, State};
 use crate::widgets::text::TextWidget;
-
-use uuid::Uuid;
-
-use nix::sys::statvfs::statvfs;
 
 #[derive(Copy, Clone, Debug, Deserialize, PartialEq, Eq)]
 pub enum Unit {
@@ -56,12 +55,15 @@ pub struct DiskSpace {
     update_interval: Duration,
     alias: String,
     path: String,
-    info_type: InfoType,
     unit: Unit,
+    info_type: InfoType,
     warning: f64,
     alert: f64,
     show_percentage: bool,
     show_bar: bool,
+    alert_absolute: bool,
+    format: FormatTemplate,
+    icon: String,
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -75,9 +77,17 @@ pub struct DiskSpaceConfig {
     #[serde(default = "DiskSpaceConfig::default_alias")]
     pub alias: String,
 
-    /// Currently supported options are available and free
+    /// Currently supported options are available, free, total and used
+    /// Sets value used for {percentage} calculation
+    /// total is the same as used, use format to set format string for output
     #[serde(default = "DiskSpaceConfig::default_info_type")]
     pub info_type: InfoType,
+
+    /// Format string for output
+    /// placeholders: {percentage}, {bar}, {path}, {alias}, {available}, {free}, {total}, {used},
+    ///               {unit}
+    #[serde(default = "DiskSpaceConfig::default_format")]
+    pub format: String,
 
     /// Unit that is used to display disk space. Options are MB, MiB, GB, GiB, TB and TiB
     #[serde(default = "DiskSpaceConfig::default_unit")]
@@ -98,13 +108,20 @@ pub struct DiskSpaceConfig {
     #[serde(default = "DiskSpaceConfig::default_alert")]
     pub alert: f64,
 
-    /// Show percentage
+    /// Show percentage - deprecated for format string, kept for previous configs
     #[serde(default = "DiskSpaceConfig::default_show_percentage")]
     pub show_percentage: bool,
 
-    /// Show percentage
+    /// Show percentage bar - deprecated for format string, kept for previous configs
     #[serde(default = "DiskSpaceConfig::default_show_bar")]
     pub show_bar: bool,
+
+    /// use absolute (unit) values for disk space alerts
+    #[serde(default = "DiskSpaceConfig::default_alert_absolute")]
+    pub alert_absolute: bool,
+
+    #[serde(default = "DiskSpaceConfig::default_color_overrides")]
+    pub color_overrides: Option<BTreeMap<String, String>>,
 }
 
 impl DiskSpaceConfig {
@@ -118,6 +135,10 @@ impl DiskSpaceConfig {
 
     fn default_info_type() -> InfoType {
         InfoType::Available
+    }
+
+    fn default_format() -> String {
+        String::from("{alias} {available} {unit}")
     }
 
     fn default_unit() -> Unit {
@@ -136,45 +157,51 @@ impl DiskSpaceConfig {
         10.
     }
 
+    // Deprecated with format string, kept for previous config support
     fn default_show_percentage() -> bool {
         false
     }
 
+    // Deprecated with format string, kept for previous config support
     fn default_show_bar() -> bool {
         false
     }
+
+    fn default_alert_absolute() -> bool {
+        false
+    }
+
+    fn default_color_overrides() -> Option<BTreeMap<String, String>> {
+        None
+    }
+}
+
+enum AlertType {
+    Above,
+    Below,
 }
 
 impl DiskSpace {
-    fn compute_state(&self, bytes: u64, warning: f64, alert: f64) -> State {
-        let value = if self.unit == Unit::Percent {
-            bytes as f64
-        } else {
-            Unit::bytes_in_unit(Unit::GB, bytes)
-        };
-        match self.unit {
-            Unit::Percent => match self.info_type {
-                InfoType::Available | InfoType::Free | InfoType::Total | InfoType::Used => {
-                    if value > alert {
-                        State::Critical
-                    } else if value <= alert && value > warning {
-                        State::Warning
-                    } else {
-                        State::Idle
-                    }
+    fn compute_state(&self, value: f64, warning: f64, alert: f64, alert_type: AlertType) -> State {
+        match alert_type {
+            AlertType::Above => {
+                if value > alert {
+                    State::Critical
+                } else if value <= alert && value > warning {
+                    State::Warning
+                } else {
+                    State::Idle
                 }
-            },
-            _ => match self.info_type {
-                InfoType::Available | InfoType::Free | InfoType::Total | InfoType::Used => {
-                    if 0. <= value && value < alert {
-                        State::Critical
-                    } else if alert <= value && value < warning {
-                        State::Warning
-                    } else {
-                        State::Idle
-                    }
+            }
+            AlertType::Below => {
+                if 0. <= value && value < alert {
+                    State::Critical
+                } else if alert <= value && value < warning {
+                    State::Warning
+                } else {
+                    State::Idle
                 }
-            },
+            }
         }
     }
 }
@@ -187,88 +214,100 @@ impl ConfigBlock for DiskSpace {
         config: Config,
         _tx_update_request: Sender<Task>,
     ) -> Result<Self> {
+        let icon = config
+            .icons
+            .get("disk_drive")
+            .cloned()
+            .unwrap_or_else(|| "".to_string());
+
         Ok(DiskSpace {
-            id: Uuid::new_v4().to_simple().to_string(),
+            id: pseudo_uuid(),
             update_interval: block_config.interval,
-            disk_space: TextWidget::new(config).with_text("DiskSpace"),
+            disk_space: TextWidget::new(config),
             alias: block_config.alias,
             path: block_config.path,
+            format: FormatTemplate::from_string(&block_config.format)?,
             info_type: block_config.info_type,
             unit: block_config.unit,
             warning: block_config.warning,
             alert: block_config.alert,
             show_percentage: block_config.show_percentage,
             show_bar: block_config.show_bar,
+            alert_absolute: block_config.alert_absolute,
+            icon,
         })
     }
 }
 
 impl Block for DiskSpace {
-    fn update(&mut self) -> Result<Option<Duration>> {
+    fn update(&mut self) -> Result<Option<Update>> {
         let statvfs = statvfs(Path::new(self.path.as_str()))
             .block_error("disk_space", "failed to retrieve statvfs")?;
-        let mut result;
-        let mut converted = 0.0f64;
-        let mut converted_str = String::new();
+
+        let result;
         let total = (statvfs.blocks() as u64) * (statvfs.fragment_size() as u64);
         let used = ((statvfs.blocks() as u64) - (statvfs.blocks_free() as u64))
             * (statvfs.fragment_size() as u64);
+        let available = (statvfs.blocks_available() as u64) * (statvfs.block_size() as u64);
+        let free = (statvfs.blocks_free() as u64) * (statvfs.block_size() as u64);
 
+        let alert_type;
         match self.info_type {
             InfoType::Available => {
-                result = (statvfs.blocks_available() as u64) * (statvfs.block_size() as u64);
-                converted = Unit::bytes_in_unit(self.unit, result);
+                result = available;
+                alert_type = AlertType::Below;
             }
             InfoType::Free => {
-                result = (statvfs.blocks_free() as u64) * (statvfs.block_size() as u64);
-                converted = Unit::bytes_in_unit(self.unit, result);
+                result = free;
+                alert_type = AlertType::Below;
             }
             InfoType::Total => {
+                // Deprecated: Same as Used - use format string to set output format
+                // Kept for back-compatibility
+                // Use format: "{used}/{total} {unit}" for previous format
                 result = used;
-                let converted_used = Unit::bytes_in_unit(self.unit, result);
-                let converted_total = Unit::bytes_in_unit(self.unit, total);
-
-                converted_str = format!("{0:.2}/{1:.2}", converted_used, converted_total);
+                alert_type = AlertType::Above;
+                self.format = FormatTemplate::from_string("{used}/{total} {unit}")?;
             }
             InfoType::Used => {
                 result = used;
-                converted = Unit::bytes_in_unit(self.unit, result);
+                alert_type = AlertType::Above;
             }
         }
 
         let percentage = (result as f32) / (total as f32) * 100f32;
-        if converted_str.is_empty() {
-            converted_str = format!("{0:.2}", converted);
-        }
-
-        if self.unit == Unit::Percent {
-            self.disk_space
-                .set_text(format!("{0} {1:.2}%", self.alias, percentage));
-            result = percentage as u64;
-        } else if self.show_percentage {
-            self.disk_space.set_text(format!(
-                "{0} {1} ({2:.2}%) {3:?}",
-                self.alias, converted_str, percentage, self.unit
-            ));
+        if self.show_percentage {
+            self.format = FormatTemplate::from_string("{alias} {result} ({percentage}) {unit}")?;
         } else if self.show_bar {
-            self.disk_space.set_text(format!(
-                "{0} {1} {2:?} {3}",
-                self.alias,
-                converted_str,
-                self.unit,
-                format_percent_bar(percentage)
-            ));
-        } else {
-            self.disk_space.set_text(format!(
-                "{0} {1} {2:?}",
-                self.alias, converted_str, self.unit
-            ));
+            self.format = FormatTemplate::from_string("{alias} {result} {unit} {bar}")?;
         }
 
-        let state = self.compute_state(result, self.warning, self.alert);
+        let values = map!("{percentage}" => format!("{:.2}%", percentage),
+        "{bar}" => format_percent_bar(percentage),
+        "{alias}" => self.alias.clone(),
+        "{unit}" => format!("{:?}", self.unit),
+        "{path}" => self.path.clone(),
+        "{total}" => format!("{:.2}", Unit::bytes_in_unit(self.unit, total)),
+        "{used}" => format!("{:.2}", Unit::bytes_in_unit(self.unit, used)),
+        "{available}" => format!("{:.2}", Unit::bytes_in_unit(self.unit, available)),
+        "{free}" => format!("{:.2}", Unit::bytes_in_unit(self.unit, free)),
+        "{icon}" => self.icon.to_string(),
+        "{result}" => format!("{:.2}", result)
+        );
+        self.disk_space
+            .set_text(self.format.render_static_str(&values)?);
+
+        // Send percentage to alert check if we don't want absolute alerts
+        let alert_val = if !self.alert_absolute {
+            percentage as f64
+        } else {
+            Unit::bytes_in_unit(self.unit, result)
+        };
+
+        let state = self.compute_state(alert_val, self.warning, self.alert, alert_type);
         self.disk_space.set_state(state);
 
-        Ok(Some(self.update_interval))
+        Ok(Some(self.update_interval.into()))
     }
 
     fn view(&self) -> Vec<&dyn I3BarWidget> {

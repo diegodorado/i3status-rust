@@ -1,18 +1,19 @@
-use crossbeam_channel::Sender;
-use serde_derive::Deserialize;
+use std::collections::BTreeMap;
 use std::time::Duration;
 
-use crate::blocks::{Block, ConfigBlock};
+use crossbeam_channel::Sender;
+use maildir::Maildir as ExtMaildir;
+use serde_derive::Deserialize;
+
+use crate::blocks::{Block, ConfigBlock, Update};
 use crate::config::Config;
 use crate::de::deserialize_duration;
 use crate::errors::*;
 use crate::input::I3BarEvent;
 use crate::scheduler::Task;
+use crate::util::pseudo_uuid;
 use crate::widget::{I3BarWidget, State};
 use crate::widgets::text::TextWidget;
-use maildir::Maildir as ExtMaildir;
-
-use uuid::Uuid;
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -66,6 +67,8 @@ pub struct MaildirConfig {
     pub display_type: MailType,
     #[serde(default = "MaildirConfig::default_icon")]
     pub icon: bool,
+    #[serde(default = "MaildirConfig::default_color_overrides")]
+    pub color_overrides: Option<BTreeMap<String, String>>,
 }
 
 impl MaildirConfig {
@@ -81,6 +84,9 @@ impl MaildirConfig {
     fn default_icon() -> bool {
         true
     }
+    fn default_color_overrides() -> Option<BTreeMap<String, String>> {
+        None
+    }
 }
 
 impl ConfigBlock for Maildir {
@@ -91,9 +97,9 @@ impl ConfigBlock for Maildir {
         config: Config,
         _tx_update_request: Sender<Task>,
     ) -> Result<Self> {
-        let widget = TextWidget::new(config.clone()).with_text("");
+        let widget = TextWidget::new(config).with_text("");
         Ok(Maildir {
-            id: Uuid::new_v4().to_simple().to_string(),
+            id: pseudo_uuid(),
             update_interval: block_config.interval,
             text: if block_config.icon {
                 widget.with_icon("mail")
@@ -109,22 +115,22 @@ impl ConfigBlock for Maildir {
 }
 
 impl Block for Maildir {
-    fn update(&mut self) -> Result<Option<Duration>> {
+    fn update(&mut self) -> Result<Option<Update>> {
         let mut newmails = 0;
         for inbox in &self.inboxes {
             let isl: &str = &inbox[..];
             let maildir = ExtMaildir::from(isl);
             newmails += self.display_type.count_mail(&maildir)
         }
-        let mut state = { State::Idle };
+        let mut state = State::Idle;
         if newmails >= self.threshold_critical {
-            state = { State::Critical };
+            state = State::Critical;
         } else if newmails >= self.threshold_warning {
-            state = { State::Warning };
+            state = State::Warning;
         }
         self.text.set_state(state);
         self.text.set_text(format!("{}", newmails));
-        Ok(Some(self.update_interval))
+        Ok(Some(self.update_interval.into()))
     }
 
     fn view(&self) -> Vec<&dyn I3BarWidget> {

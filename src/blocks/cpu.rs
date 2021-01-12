@@ -1,34 +1,40 @@
-use crate::scheduler::Task;
-use crate::util::{format_percent_bar, FormatTemplate};
-use crossbeam_channel::Sender;
-use serde_derive::Deserialize;
-use std::time::Duration;
-
-use crate::blocks::{Block, ConfigBlock};
-use crate::config::Config;
-use crate::de::deserialize_duration;
-use crate::errors::*;
-use crate::widget::{I3BarWidget, State};
-use crate::widgets::text::TextWidget;
-
+use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::prelude::*;
 use std::io::BufReader;
+use std::time::Duration;
 
-use uuid::Uuid;
+use crossbeam_channel::Sender;
+use serde_derive::Deserialize;
+
+use crate::blocks::{Block, ConfigBlock, Update};
+use crate::config::Config;
+use crate::de::deserialize_duration;
+use crate::errors::*;
+use crate::input::{I3BarEvent, MouseButton};
+use crate::scheduler::Task;
+use crate::subprocess::spawn_child_async;
+use crate::util::{format_percent_bar, pseudo_uuid, FormatTemplate};
+use crate::widget::{I3BarWidget, State};
+use crate::widgets::button::ButtonWidget;
+
+/// Maximum number of CPUs we support.
+const MAX_CPUS: usize = 32;
 
 pub struct Cpu {
-    output: TextWidget,
-    prev_idles: [u64; 32],
-    prev_non_idles: [u64; 32],
+    output: ButtonWidget,
+    prev_idles: [u64; MAX_CPUS],
+    prev_non_idles: [u64; MAX_CPUS],
     id: String,
     update_interval: Duration,
     minimum_info: u64,
     minimum_warning: u64,
     minimum_critical: u64,
+    on_click: Option<String>,
     format: FormatTemplate,
     has_barchart: bool,
     has_frequency: bool,
+    per_core: bool,
 }
 
 #[derive(Deserialize, Debug, Default, Clone)]
@@ -53,6 +59,9 @@ pub struct CpuConfig {
     #[serde(default = "CpuConfig::default_critical")]
     pub critical: u64,
 
+    #[serde(default = "CpuConfig::default_on_click")]
+    pub on_click: Option<String>,
+
     /// Display frequency
     #[serde(default = "CpuConfig::default_frequency")]
     pub frequency: bool,
@@ -60,6 +69,13 @@ pub struct CpuConfig {
     /// Format override
     #[serde(default = "CpuConfig::default_format")]
     pub format: String,
+
+    /// Compute the metrics (utilization and frequency) per core.
+    #[serde(default)]
+    pub per_core: bool,
+
+    #[serde(default = "CpuConfig::default_color_overrides")]
+    pub color_overrides: Option<BTreeMap<String, String>>,
 }
 
 impl CpuConfig {
@@ -86,6 +102,14 @@ impl CpuConfig {
     fn default_frequency() -> bool {
         false
     }
+
+    fn default_on_click() -> Option<String> {
+        None
+    }
+
+    fn default_color_overrides() -> Option<BTreeMap<String, String>> {
+        None
+    }
 }
 
 impl ConfigBlock for Cpu {
@@ -96,17 +120,22 @@ impl ConfigBlock for Cpu {
         config: Config,
         _tx_update_request: Sender<Task>,
     ) -> Result<Self> {
-        let mut format = block_config.format;
-        if block_config.frequency {
-            format = "{utilization}% {frequency}GHz".into();
-        }
+        let format = if block_config.frequency {
+            "{utilization}% {frequency}GHz".into()
+        } else if block_config.per_core {
+            "{utilization}".to_owned()
+        } else {
+            block_config.format
+        };
+
+        let id = pseudo_uuid();
 
         Ok(Cpu {
-            id: Uuid::new_v4().to_simple().to_string(),
+            id: id.clone(),
             update_interval: block_config.interval,
-            output: TextWidget::new(config).with_icon("cpu"),
-            prev_idles: [0; 32],
-            prev_non_idles: [0; 32],
+            output: ButtonWidget::new(config, &id).with_icon("cpu"),
+            prev_idles: [0; MAX_CPUS],
+            prev_non_idles: [0; MAX_CPUS],
             minimum_info: block_config.info,
             minimum_warning: block_config.warning,
             minimum_critical: block_config.critical,
@@ -114,18 +143,20 @@ impl ConfigBlock for Cpu {
                 .block_error("cpu", "Invalid format specified for cpu")?,
             has_frequency: format.contains("{frequency}"),
             has_barchart: format.contains("{barchart}"),
+            per_core: block_config.per_core,
+            on_click: block_config.on_click,
         })
     }
 }
 
 impl Block for Cpu {
-    fn update(&mut self) -> Result<Option<Duration>> {
+    fn update(&mut self) -> Result<Option<Update>> {
         let f = File::open("/proc/stat")
             .block_error("cpu", "Your system doesn't support /proc/stat")?;
         let f = BufReader::new(f);
 
+        let mut cpu_freqs: [f32; MAX_CPUS] = [0.0; MAX_CPUS];
         let mut n_cpu = 0;
-        let mut freq: f32 = 0.0;
         if self.has_frequency {
             let freq_file =
                 File::open("/proc/cpuinfo").block_error("cpu", "failed to read /proc/cpuinfo")?;
@@ -140,18 +171,16 @@ impl Block for Cpu {
                     let numb = last
                         .parse::<f32>()
                         .expect("failed to parse String to f32 while getting cpu frequency");
-                    freq += numb;
+                    cpu_freqs[n_cpu] = numb;
                     n_cpu += 1;
+                    if n_cpu >= MAX_CPUS {
+                        break;
+                    };
                 }
             }
-            // get the average
-            freq = (freq / (n_cpu as f32) / 1000.0) as f32;
         }
 
-        // Read data from a maximum of 32 CPU cores, if a barchart is displayed
-        let max_cpus = if self.has_barchart { 32 } else { 1 };
-        let mut cpu_utilizations = vec![0.0; max_cpus];
-
+        let mut cpu_utilizations: [f64; MAX_CPUS] = [0.0; MAX_CPUS];
         let mut cpu_i = 0;
         for line in f.lines().scan((), |_, x| x.ok()) {
             if line.starts_with("cpu") {
@@ -190,7 +219,7 @@ impl Block for Cpu {
                 self.prev_idles[cpu_i] = idle;
                 self.prev_non_idles[cpu_i] = non_idle;
                 cpu_i += 1;
-                if cpu_i >= max_cpus {
+                if cpu_i >= MAX_CPUS {
                     break;
                 };
             }
@@ -219,23 +248,64 @@ impl Block for Cpu {
                 );
             }
         }
-
-        let values = map!("{frequency}" => format!("{:.*}", 1, freq),
+        let values = map!("{frequency}" => format_frequency(&cpu_freqs, n_cpu, self.per_core),
                           "{barchart}" => barchart,
-                          "{utilization}" => format!("{:02}", avg_utilization),
+                          "{utilization}" => format_utilization(&cpu_utilizations, cpu_i, self.per_core),
                           "{utilizationbar}" => format_percent_bar(avg_utilization as f32));
 
         self.output
             .set_text(self.format.render_static_str(&values)?);
 
-        Ok(Some(self.update_interval))
+        Ok(Some(self.update_interval.into()))
     }
 
     fn view(&self) -> Vec<&dyn I3BarWidget> {
         vec![&self.output]
     }
 
+    fn click(&mut self, e: &I3BarEvent) -> Result<()> {
+        if e.matches_name(self.id()) {
+            if let MouseButton::Left = e.button {
+                if let Some(ref cmd) = self.on_click {
+                    spawn_child_async("sh", &["-c", cmd])
+                        .block_error("cpu", "could not spawn child")?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn id(&self) -> &str {
         &self.id
+    }
+}
+
+#[inline]
+fn format_utilization(values: &[f64], count: usize, per_core: bool) -> String {
+    if per_core {
+        values
+            .iter()
+            .take(count)
+            .skip(1) // The first value is a global one.
+            .map(|v| format!("{:02.0}%", 100.0 * v))
+            .collect::<Vec<String>>()
+            .join(" ")
+    } else {
+        format!("{:02.0}", 100.0 * values[0])
+    }
+}
+
+#[inline]
+fn format_frequency(cpu_freqs: &[f32], count: usize, per_core: bool) -> String {
+    if per_core {
+        cpu_freqs
+            .iter()
+            .take(count)
+            .map(|v| format!("{0:.1}GHz", v / 1000.0))
+            .collect::<Vec<String>>()
+            .join(" ")
+    } else {
+        let avg = cpu_freqs.iter().take(count).sum::<f32>() / (count as f32) / 1000.0;
+        format!("{:.1}", avg)
     }
 }

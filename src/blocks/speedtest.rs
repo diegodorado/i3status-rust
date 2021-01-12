@@ -1,20 +1,22 @@
-use crate::scheduler::Task;
-use crossbeam_channel::{unbounded, Receiver, Sender};
-use serde_derive::Deserialize;
+use std::collections::BTreeMap;
+use std::fmt;
 use std::process::Command;
 use std::sync::{Arc, Mutex};
-use std::thread::spawn;
+use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::blocks::{Block, ConfigBlock};
+use crossbeam_channel::{unbounded, Receiver, Sender};
+use serde_derive::Deserialize;
+
+use crate::blocks::{Block, ConfigBlock, Update};
 use crate::config::Config;
 use crate::de::deserialize_duration;
 use crate::errors::*;
 use crate::input::{I3BarEvent, MouseButton};
+use crate::scheduler::Task;
+use crate::util::{format_number, pseudo_uuid};
 use crate::widget::{I3BarWidget, State};
 use crate::widgets::button::ButtonWidget;
-
-use uuid::Uuid;
 
 pub struct SpeedTest {
     vals: Arc<Mutex<(bool, Vec<f32>)>>,
@@ -22,6 +24,27 @@ pub struct SpeedTest {
     id: String,
     config: SpeedTestConfig,
     send: Sender<()>,
+}
+
+#[derive(Copy, Clone, Debug, Deserialize)]
+pub enum Unit {
+    B,
+    K,
+    M,
+    G,
+    T,
+}
+
+impl Default for Unit {
+    fn default() -> Self {
+        Unit::K
+    }
+}
+
+impl fmt::Display for Unit {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{:?}", self)
+    }
 }
 
 #[derive(Deserialize, Debug, Default, Clone)]
@@ -37,6 +60,17 @@ pub struct SpeedTestConfig {
     /// Mode of speed display, true => MB/s, false => Mb/s
     #[serde(default = "SpeedTestConfig::default_bytes")]
     pub bytes: bool,
+
+    /// Number of digits to show for throughput indiciators.
+    #[serde(default = "SpeedTestConfig::default_speed_digits")]
+    pub speed_digits: usize,
+
+    /// Minimum unit to display for throughput indicators.
+    #[serde(default = "SpeedTestConfig::default_speed_min_unit")]
+    pub speed_min_unit: Unit,
+
+    #[serde(default = "SpeedTestConfig::default_color_overrides")]
+    pub color_overrides: Option<BTreeMap<String, String>>,
 }
 
 impl SpeedTestConfig {
@@ -46,6 +80,18 @@ impl SpeedTestConfig {
 
     fn default_bytes() -> bool {
         false
+    }
+
+    fn default_speed_min_unit() -> Unit {
+        Unit::M
+    }
+
+    fn default_speed_digits() -> usize {
+        3
+    }
+
+    fn default_color_overrides() -> Option<BTreeMap<String, String>> {
+        None
     }
 }
 
@@ -87,28 +133,31 @@ fn make_thread(
     config: SpeedTestConfig,
     id: String,
 ) {
-    spawn(move || loop {
-        if !recv.recv().is_err() {
-            if let Ok(output) = get_values(config.bytes) {
-                if let Ok(vals) = parse_values(&output) {
-                    if vals.len() == 3 {
-                        let (ref mut update, ref mut values) = *values
-                            .lock()
-                            .expect("main thread paniced while holding speedtest-values mutex");
-                        *values = vals;
+    thread::Builder::new()
+        .name("speedtest".into())
+        .spawn(move || loop {
+            if recv.recv().is_ok() {
+                if let Ok(output) = get_values(config.bytes) {
+                    if let Ok(vals) = parse_values(&output) {
+                        if vals.len() == 3 {
+                            let (ref mut update, ref mut values) = *values
+                                .lock()
+                                .expect("main thread paniced while holding speedtest-values mutex");
+                            *values = vals;
 
-                        *update = true;
+                            *update = true;
 
-                        done.send(Task {
-                            id: id.clone(),
-                            update_time: Instant::now(),
-                        })
-                        .unwrap();
+                            done.send(Task {
+                                id: id.clone(),
+                                update_time: Instant::now(),
+                            })
+                            .unwrap();
+                        }
                     }
                 }
             }
-        }
-    });
+        })
+        .unwrap();
 }
 
 impl ConfigBlock for SpeedTest {
@@ -118,7 +167,7 @@ impl ConfigBlock for SpeedTest {
         // Create all the things we are going to send and take for ourselves.
         let (send, recv): (Sender<()>, Receiver<()>) = unbounded();
         let vals = Arc::new(Mutex::new((false, vec![])));
-        let id = Uuid::new_v4().to_simple().to_string();
+        let id = pseudo_uuid();
 
         // Make the update thread
         make_thread(recv, done, vals.clone(), block_config.clone(), id.clone());
@@ -133,7 +182,7 @@ impl ConfigBlock for SpeedTest {
                 ButtonWidget::new(config.clone(), &id)
                     .with_icon("net_down")
                     .with_text(&format!("0{}", ty)),
-                ButtonWidget::new(config.clone(), &id)
+                ButtonWidget::new(config, &id)
                     .with_icon("net_up")
                     .with_text(&format!("0{}", ty)),
             ],
@@ -145,7 +194,7 @@ impl ConfigBlock for SpeedTest {
 }
 
 impl Block for SpeedTest {
-    fn update(&mut self) -> Result<Option<Duration>> {
+    fn update(&mut self) -> Result<Option<Update>> {
         let (ref mut updated, ref vals) = *self
             .vals
             .lock()
@@ -155,23 +204,37 @@ impl Block for SpeedTest {
             *updated = false;
 
             if vals.len() == 3 {
-                let ty = if self.config.bytes { "MB/s" } else { "Mb/s" };
+                let ping = vals[0] as f64 / 1_000.0;
+                let down = vals[1] as f64 * 1_000_000.0;
+                let up = vals[2] as f64 * 1_000_000.0;
+                self.text[0].set_text(format_number(ping, self.config.speed_digits, "", "s"));
+                self.text[1].set_text(format_number(
+                    down,
+                    self.config.speed_digits,
+                    &self.config.speed_min_unit.to_string(),
+                    if self.config.bytes { "B/s" } else { "b/s" },
+                ));
+                self.text[2].set_text(format_number(
+                    up,
+                    self.config.speed_digits,
+                    &self.config.speed_min_unit.to_string(),
+                    if self.config.bytes { "B/s" } else { "b/s" },
+                ));
 
-                self.text[0].set_text(format!("{}ms", vals[0]));
-                self.text[1].set_text(format!("{}{}", vals[1], ty));
-                self.text[2].set_text(format!("{}{}", vals[2], ty));
-
+                // TODO: remove clippy workaround
+                #[allow(clippy::unknown_clippy_lints)]
+                #[allow(clippy::match_on_vec_items)]
                 self.text[0].set_state(match_range!(vals[0], default: (State::Critical) {
-                            0.0 ; 25.0 => State::Good,
-                            25.0 ; 60.0 => State::Info,
-                            60.0 ; 100.0 => State::Warning
+                    0.0 ; 25.0 => State::Good,
+                    25.0 ; 60.0 => State::Info,
+                    60.0 ; 100.0 => State::Warning
                 }));
             }
 
             Ok(None)
         } else {
             self.send.send(())?;
-            Ok(Some(self.config.interval))
+            Ok(Some(self.config.interval.into()))
         }
     }
 

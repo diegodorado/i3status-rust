@@ -1,25 +1,114 @@
-use crate::blocks::Block;
-use crate::config::Config;
-use crate::errors::*;
-use regex::Regex;
-use serde::de::DeserializeOwned;
-use serde_json::value::Value;
+use num_traits::{clamp, ToPrimitive};
 use std::collections::HashMap;
 use std::fmt::Display;
 use std::fs::{File, OpenOptions};
 use std::io::prelude::*;
 use std::io::BufReader;
-use std::num::ParseIntError;
 use std::path::{Path, PathBuf};
 use std::prelude::v1::String;
-use toml;
+use std::process::Command;
+
+use regex::Regex;
+use serde::de::DeserializeOwned;
+
+use crate::blocks::Block;
+use crate::config::Config;
+use crate::errors::*;
+
+pub const USR_SHARE_PATH: &str = "/usr/share/i3status-rust";
+
+pub fn pseudo_uuid() -> String {
+    let mut bytes = [0u8; 16];
+    getrandom::getrandom(&mut bytes).unwrap();
+    let uuid: String = bytes.iter().map(|&x| format!("{:02x?}", x)).collect();
+    uuid
+}
+
+pub fn escape_pango_text(text: String) -> String {
+    text.chars()
+        .map(|x| match x {
+            '&' => "&amp;".to_string(),
+            '<' => "&lt;".to_string(),
+            '>' => "&gt;".to_string(),
+            '\'' => "&#39;".to_string(),
+            _ => x.to_string(),
+        })
+        .collect()
+}
+
+pub fn format_number(raw_value: f64, total_digits: usize, min_unit: &str, suffix: &str) -> String {
+    let (min_unit_value, min_unit_level) = match min_unit {
+        "T" => (raw_value / 1_000_000_000_000.0, 4),
+        "G" => (raw_value / 1_000_000_000.0, 3),
+        "M" => (raw_value / 1_000_000.0, 2),
+        "K" => (raw_value / 1_000.0, 1),
+        "1" => (raw_value, 0),
+        "m" => (raw_value * 1_000.0, -1),
+        "u" => (raw_value * 1_000_000.0, -2),
+        "n" => (raw_value * 1_000_000_000.0, -3),
+        _ => (raw_value * 1_000_000_000_000.0, -4),
+    };
+
+    //println!("Min Unit:  ({}, {})", min_unit_value, min_unit_level);
+
+    let (magnitude_value, magnitude_level) = match raw_value {
+        x if x >= 100_000_000_000.0 => (raw_value / 1_000_000_000_000.0, 4),
+        x if x >= 100_000_000.0 => (raw_value / 1_000_000_000.0, 3),
+        x if x >= 100_000.0 => (raw_value / 1_000_000.0, 2),
+        x if x >= 100.0 => (raw_value / 1_000.0, 1),
+        x if x >= 0.1 => (raw_value, 0),
+        x if x >= 0.000_1 => (raw_value * 1_000.0, -1),
+        x if x >= 0.000_000_1 => (raw_value * 1_000_000.0, -2),
+        x if x >= 0.000_000_000_1 => (raw_value * 1_000_000_000.0, -3),
+        _ => (raw_value * 1_000_000_000_000.0, -4),
+    };
+
+    //println!("Magnitude: ({}, {})", magnitude_value, magnitude_level);
+
+    let (value, level) = if magnitude_level < min_unit_level {
+        (min_unit_value, min_unit_level)
+    } else {
+        (magnitude_value, magnitude_level)
+    };
+
+    let unit = match level {
+        4 => "T",
+        3 => "G",
+        2 => "M",
+        1 => "K",
+        0 => "",
+        -1 => "m",
+        -2 => "u",
+        -3 => "n",
+        _ => "p",
+    };
+
+    let _decimal_precision = total_digits as i16 - if value >= 10.0 { 2 } else { 1 };
+    let decimal_precision = if _decimal_precision < 0 {
+        0
+    } else {
+        _decimal_precision
+    };
+
+    format!("{:.*}{}{}", decimal_precision as usize, value, unit, suffix)
+}
+
+pub fn battery_level_to_icon(charge_level: Result<u64>) -> &'static str {
+    match charge_level {
+        Ok(0..=5) => "bat_empty",
+        Ok(6..=25) => "bat_quarter",
+        Ok(26..=50) => "bat_half",
+        Ok(51..=75) => "bat_three_quarters",
+        _ => "bat_full",
+    }
+}
 
 pub fn xdg_config_home() -> PathBuf {
     // In the unlikely event that $HOME is not set, it doesn't really matter
     // what we fall back on, so use /.config.
     let config_path = std::env::var("XDG_CONFIG_HOME").unwrap_or(format!(
         "{}/.config",
-        std::env::var("HOME").unwrap_or("".to_string())
+        std::env::var("HOME").unwrap_or_else(|_| "".to_string())
     ));
     PathBuf::from(&config_path)
 }
@@ -52,13 +141,18 @@ pub fn read_file(blockname: &str, path: &Path) -> Result<String> {
     Ok(content)
 }
 
-#[allow(dead_code)]
-pub fn get_file(name: &str) -> Result<String> {
-    let mut file_contents = String::new();
-    let mut file = File::open(name).internal_error("util", &format!("Unable to open {}", name))?;
-    file.read_to_string(&mut file_contents)
-        .internal_error("util", &format!("Unable to read {}", name))?;
-    Ok(file_contents)
+pub fn has_command(block_name: &str, command: &str) -> Result<bool> {
+    let exit_status = Command::new("sh")
+        .args(&[
+            "-c",
+            format!("command -v {} >/dev/null 2>&1", command).as_ref(),
+        ])
+        .status()
+        .block_error(
+            block_name,
+            format!("failed to start command to check for {}", command).as_ref(),
+        )?;
+    Ok(exit_status.success())
 }
 
 macro_rules! match_range {
@@ -96,31 +190,30 @@ macro_rules! map_to_owned (
      };
 );
 
-struct PrintState {
-    pub last_bg: Option<String>,
-    pub has_predecessor: bool,
-}
-
-impl PrintState {
-    fn set_last_bg(&mut self, bg: String) {
-        self.last_bg = Some(bg);
-    }
-    fn set_predecessor(&mut self, pre: bool) {
-        self.has_predecessor = pre;
-    }
-}
-
 pub fn print_blocks(
     order: &[String],
     block_map: &HashMap<String, &mut dyn Block>,
     config: &Config,
 ) -> Result<()> {
-    let mut state = PrintState {
-        has_predecessor: false,
-        last_bg: None,
-    };
+    let mut last_bg: Option<String> = None;
 
-    print!("[");
+    let mut rendered_blocks = vec![];
+
+    /* To always start with the same alternating tint on the right side of the
+     * bar it is easiest to calculate the number of visible blocks here and
+     * flip the starting tint if an even number of blocks is visible. This way,
+     * the last block should always be untinted.
+     */
+    let visible_count = order
+        .iter()
+        .filter(|block_id| {
+            let block = block_map.get(block_id.as_str()).unwrap();
+            !block.view().is_empty()
+        })
+        .count();
+
+    let mut alternator = visible_count % 2 == 0;
+
     for block_id in order {
         let block = &(*(block_map
             .get(block_id)
@@ -129,64 +222,108 @@ pub fn print_blocks(
         if widgets.is_empty() {
             continue;
         }
-        let first = widgets[0];
-        let color = first.get_rendered()["background"]
+
+        // Get the final JSON from all the widgets for this block
+        let mut rendered_widgets = widgets
+            .iter()
+            .map(|widget| {
+                let mut w_json: serde_json::Value = widget.get_rendered().to_owned();
+                if alternator {
+                    // Apply tint for all widgets of every second block
+                    *w_json.get_mut("background").unwrap() = json!(add_colors(
+                        w_json["background"].as_str(),
+                        config.theme.alternating_tint_bg.as_deref()
+                    )
+                    .unwrap());
+                    *w_json.get_mut("color").unwrap() = json!(add_colors(
+                        w_json["color"].as_str(),
+                        config.theme.alternating_tint_fg.as_deref()
+                    )
+                    .unwrap());
+                }
+                w_json
+            })
+            .collect::<Vec<serde_json::Value>>();
+
+        alternator = !alternator;
+
+        if config.theme.native_separators == Some(true) {
+            // Re-add native separator on last widget for native theme
+            *rendered_widgets
+                .last_mut()
+                .unwrap()
+                .get_mut("separator")
+                .unwrap() = json!(null);
+            *rendered_widgets
+                .last_mut()
+                .unwrap()
+                .get_mut("separator_block_width")
+                .unwrap() = json!(null);
+        }
+
+        // Serialize and concatenate widgets
+        let block_str = rendered_widgets
+            .iter()
+            .map(|w| w.to_string())
+            .collect::<Vec<String>>()
+            .join(",");
+
+        if config.theme.native_separators == Some(true) {
+            // Skip separator block for native theme
+            rendered_blocks.push(block_str.to_string());
+            continue;
+        }
+
+        // The first widget's BG is used to get the FG color for the current separator
+        let first_bg = rendered_widgets.first().unwrap()["background"]
             .as_str()
             .internal_error("util", "couldn't get background color")?;
 
-        let sep_fg = if config.theme.separator_fg == "auto" {
-            color
+        let sep_fg = if config.theme.separator_fg == Some("auto".to_string()) {
+            Some(first_bg.to_string())
         } else {
-            &config.theme.separator_fg
+            config.theme.separator_fg.clone()
         };
 
-        let sep_bg = if config.theme.separator_bg == "auto" {
-            state.last_bg.clone()
+        // The separator's BG is the last block's last widget's BG
+        let sep_bg = if config.theme.separator_bg == Some("auto".to_string()) {
+            last_bg
         } else {
-            Some(config.theme.separator_bg.clone())
+            config.theme.separator_bg.clone()
         };
 
         let separator = json!({
             "full_text": config.theme.separator,
             "separator": false,
             "separator_block_width": 0,
-            "background": if sep_bg.is_some() { Value::String(sep_bg.unwrap()) } else { Value::Null },
+            "background": sep_bg,
             "color": sep_fg,
             "markup": "pango"
         });
-        print!(
-            "{}{},",
-            if state.has_predecessor { "," } else { "" },
-            separator.to_string()
-        );
-        print!("{}", first.to_string());
-        state.set_last_bg(color.to_owned());
-        state.set_predecessor(true);
 
-        for widget in widgets.iter().skip(1) {
-            print!(
-                "{}{}",
-                if state.has_predecessor { "," } else { "" },
-                widget.to_string()
-            );
-            state.set_last_bg(String::from(
-                widget.get_rendered()["background"]
-                    .as_str()
-                    .internal_error("util", "couldn't get background color")?,
-            ));
-            state.set_predecessor(true);
-        }
+        rendered_blocks.push(format!("{},{}", separator.to_string(), block_str));
+
+        // The last widget's BG is used to get the BG color for the next separator
+        last_bg = Some(
+            rendered_widgets.last().unwrap()["background"]
+                .as_str()
+                .internal_error("util", "couldn't get background color")?
+                .to_string(),
+        );
     }
-    println!("],");
+
+    println!("[{}],", rendered_blocks.join(","));
 
     Ok(())
 }
 
-pub fn color_from_rgba(color: &str) -> ::std::result::Result<(u8, u8, u8, u8), ParseIntError> {
+pub fn color_from_rgba(
+    color: &str,
+) -> ::std::result::Result<(u8, u8, u8, u8), Box<dyn std::error::Error>> {
     Ok((
-        u8::from_str_radix(&color[1..3], 16)?,
-        u8::from_str_radix(&color[3..5], 16)?,
-        u8::from_str_radix(&color[5..7], 16)?,
+        u8::from_str_radix(&color.get(1..3).ok_or("invalid rgba color")?, 16)?,
+        u8::from_str_radix(&color.get(3..5).ok_or("invalid rgba color")?, 16)?,
+        u8::from_str_radix(&color.get(5..7).ok_or("invalid rgba color")?, 16)?,
         u8::from_str_radix(&color.get(7..9).unwrap_or("FF"), 16)?,
     ))
 }
@@ -198,6 +335,28 @@ pub fn color_to_rgba(color: (u8, u8, u8, u8)) -> String {
     )
 }
 
+// TODO: Allow for other non-additive tints
+pub fn add_colors(
+    a: Option<&str>,
+    b: Option<&str>,
+) -> ::std::result::Result<Option<String>, Box<dyn std::error::Error>> {
+    match (a, b) {
+        (None, _) => Ok(None),
+        (Some(a), None) => Ok(Some(a.to_string())),
+        (Some(a), Some(b)) => {
+            let (r_a, g_a, b_a, a_a) = color_from_rgba(a)?;
+            let (r_b, g_b, b_b, a_b) = color_from_rgba(b)?;
+
+            Ok(Some(color_to_rgba((
+                r_a.saturating_add(r_b),
+                g_a.saturating_add(g_b),
+                b_a.saturating_add(b_b),
+                a_a.saturating_add(a_b),
+            ))))
+        }
+    }
+}
+
 pub fn format_percent_bar(percent: f32) -> String {
     let percent = percent.min(100.0);
     let percent = percent.max(0.0);
@@ -207,10 +366,8 @@ pub fn format_percent_bar(percent: f32) -> String {
             let bucket_min = (index * 10) as f32;
             let fraction = percent - bucket_min;
             //println!("Fraction: {}", fraction);
-            if fraction < 0.0 {
+            if fraction < 1.25 {
                 '\u{2581}' // 1/8 block for empty so the whole bar is always visible
-            } else if fraction < 1.25 {
-                '\u{2581}' // 1/8 block
             } else if fraction < 2.5 {
                 '\u{2582}' // 2/8 block
             } else if fraction < 3.75 {
@@ -230,17 +387,35 @@ pub fn format_percent_bar(percent: f32) -> String {
         .collect()
 }
 
-// TODO: Allow for other non-additive tints
-pub fn add_colors(a: &str, b: &str) -> ::std::result::Result<String, ParseIntError> {
-    let (r_a, g_a, b_a, a_a) = color_from_rgba(a)?;
-    let (r_b, g_b, b_b, a_b) = color_from_rgba(b)?;
-
-    Ok(color_to_rgba((
-        r_a.checked_add(r_b).unwrap_or(255),
-        g_a.checked_add(g_b).unwrap_or(255),
-        b_a.checked_add(b_b).unwrap_or(255),
-        a_a.checked_add(a_b).unwrap_or(255),
-    )))
+pub fn format_vec_to_bar_graph<T>(content: &[T], min: Option<T>, max: Option<T>) -> String
+where
+    T: Ord + ToPrimitive,
+{
+    // (x * one eighth block) https://en.wikipedia.org/wiki/Block_Elements
+    let bars = [
+        '\u{2581}', '\u{2582}', '\u{2583}', '\u{2584}', '\u{2585}', '\u{2586}', '\u{2587}',
+        '\u{2588}',
+    ];
+    let min: f64 = match min {
+        Some(x) => x.to_f64().unwrap(),
+        None => content.iter().min().unwrap().to_f64().unwrap(),
+    };
+    let max: f64 = match max {
+        Some(x) => x.to_f64().unwrap(),
+        None => content.iter().max().unwrap().to_f64().unwrap(),
+    };
+    let extant = max - min;
+    if extant.is_normal() {
+        let length = bars.len() as f64 - 1.0;
+        content
+            .iter()
+            .map(|x| {
+                bars[((clamp(x.to_f64().unwrap(), min, max) - min) / extant * length) as usize]
+            })
+            .collect::<_>()
+    } else {
+        (0..content.len() - 1).map(|_| bars[0]).collect::<_>()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -254,7 +429,7 @@ impl FormatTemplate {
         let s_as_bytes = s.as_bytes();
 
         //valid var tokens: {} containing any amount of alphanumericals
-        let re = Regex::new(r"\{[a-zA-Z0-9]+?\}").internal_error("util", "invalid regex")?;
+        let re = Regex::new(r"\{[a-zA-Z0-9_-]+?\}").internal_error("util", "invalid regex")?;
 
         let mut token_vec: Vec<FormatTemplate> = vec![];
         let mut start: usize = 0;
@@ -346,26 +521,49 @@ macro_rules! if_debug {
     ($x:block) => (if cfg!(debug_assertions) $x)
 }
 
-macro_rules! mapped_struct {
-    ($( #[$attr:meta] )* pub struct $name:ident : $fieldtype:ty { $( pub $fname:ident ),* }) => {
-        $( #[$attr] )*
-        pub struct $name {
-            $( pub $fname : $fieldtype ),*
-        }
+#[cfg(test)]
+mod tests {
+    use crate::util::{color_from_rgba, has_command};
 
-        impl $name {
-            #[allow(dead_code)]
-            pub fn map(&self) -> ::std::collections::HashMap<&'static str, &$fieldtype> {
-                let mut m = ::std::collections::HashMap::new();
-                $( m.insert(stringify!($fname), &self.$fname); )*
-                m
-            }
+    #[test]
+    // we assume sh is always available
+    fn test_has_command_ok() {
+        let has_command = has_command("none", "sh");
+        assert!(has_command.is_ok());
+        let has_command = has_command.unwrap();
+        assert!(has_command);
+    }
 
-            pub fn owned_map(&self) -> ::std::collections::HashMap<String, $fieldtype> {
-                let mut m = ::std::collections::HashMap::new();
-                $( m.insert(stringify!($fname).to_owned(), self.$fname.to_owned()); )*
-                m
-            }
-        }
+    #[test]
+    // we assume thequickbrownfoxjumpsoverthelazydog command does not exist
+    fn test_has_command_err() {
+        let has_command = has_command("none", "thequickbrownfoxjumpsoverthelazydog");
+        assert!(has_command.is_ok());
+        let has_command = has_command.unwrap();
+        assert!(!has_command)
+    }
+    #[test]
+    fn test_color_from_rgba() {
+        let valid_rgb = "#AABBCC"; //rgb
+        let rgba = color_from_rgba(valid_rgb);
+        assert!(rgba.is_ok());
+        assert_eq!(rgba.unwrap(), (0xAA, 0xBB, 0xCC, 0xFF));
+        let valid_rgba = "#AABBCC00"; // rgba
+        let rgba = color_from_rgba(valid_rgba);
+        assert!(rgba.is_ok());
+        assert_eq!(rgba.unwrap(), (0xAA, 0xBB, 0xCC, 0x00));
+    }
+
+    #[test]
+    fn test_color_from_rgba_invalid() {
+        let invalid = "invalid";
+        let rgba = color_from_rgba(invalid);
+        assert!(rgba.is_err());
+        let invalid = "AA"; // too short
+        let rgba = color_from_rgba(invalid);
+        assert!(rgba.is_err());
+        let invalid = "AABBCC"; // invalid rgba (missing #)
+        let rgba = color_from_rgba(invalid);
+        assert!(rgba.is_err());
     }
 }

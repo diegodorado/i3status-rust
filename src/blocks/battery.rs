@@ -4,29 +4,42 @@
 //! display the status, capacity, and time remaining for (dis)charge for an
 //! internal power supply.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::Sender;
-use dbus;
 use dbus::arg::Array;
 use dbus::ffidisp::stdintf::org_freedesktop_dbus::Properties;
 use serde_derive::Deserialize;
-use uuid::Uuid;
 
-use crate::blocks::{Block, ConfigBlock};
+use crate::blocks::{Block, ConfigBlock, Update};
 use crate::config::Config;
 use crate::de::deserialize_duration;
 use crate::errors::*;
 use crate::scheduler::Task;
-use crate::util::{format_percent_bar, read_file, FormatTemplate};
-use crate::widget::{I3BarWidget, State};
+use crate::util::{
+    battery_level_to_icon, format_percent_bar, pseudo_uuid, read_file, FormatTemplate,
+};
+use crate::widget::{I3BarWidget, Spacing, State};
 use crate::widgets::text::TextWidget;
 
 /// A battery device can be queried for a few properties relevant to the user.
 pub trait BatteryDevice {
-    /// Query the device status, one of `"Full"`, `"Charging"`, `"Discharging"`,
+    /// Query whether the device is available. Batteries can be hot-swappable
+    /// and configurations may be used for multiple devices (desktop AND laptop).
+    fn is_available(&self) -> bool;
+
+    /// Logic for getting some static battery specs.
+    /// An error may be thrown when these specs cannot be found or
+    /// if the device is unexpectedly missing.
+    ///
+    /// Batteries can be hot-swappable, meaning that they can go away and be replaced
+    /// with another battery with differrent specs.
+    fn refresh_device_info(&mut self) -> Result<()>;
+
+    /// Query the device status. One of `"Full"`, `"Charging"`, `"Discharging"`,
     /// or `"Unknown"`. Thinkpad batteries also report "`Not charging`", which
     /// for our purposes should be treated as equivalent to full.
     fn status(&self) -> Result<String>;
@@ -45,30 +58,55 @@ pub trait BatteryDevice {
 /// Represents a physical power supply device, as known to sysfs.
 pub struct PowerSupplyDevice {
     device_path: PathBuf,
+    allow_missing: bool,
     charge_full: Option<u64>,
     energy_full: Option<u64>,
 }
 
 impl PowerSupplyDevice {
     /// Use the power supply device `device`, as found in the
-    /// `/sys/class/power_supply` directory. Raises an error if a directory for
-    /// that device is not found.
-    pub fn from_device(device: &str) -> Result<Self> {
+    /// `/sys/class/power_supply` directory. Raises an error if the directory for
+    /// that device cannot be found and `allow_missing` is `false`.
+    pub fn from_device(device: &str, allow_missing: bool) -> Result<Self> {
         let device_path = Path::new("/sys/class/power_supply").join(device);
-        if !device_path.exists() {
+
+        let device = PowerSupplyDevice {
+            device_path,
+            allow_missing,
+            charge_full: None,
+            energy_full: None,
+        };
+
+        Ok(device)
+    }
+}
+
+impl BatteryDevice for PowerSupplyDevice {
+    fn is_available(&self) -> bool {
+        self.device_path.exists()
+    }
+
+    fn refresh_device_info(&mut self) -> Result<()> {
+        if !self.is_available() {
+            // The user indicated that it's ok for this battery to be missing/go away
+            if self.allow_missing {
+                self.charge_full = None;
+                self.energy_full = None;
+                return Ok(());
+            }
             return Err(BlockError(
-                "battery".to_string(),
+                "battery".into(),
                 format!(
                     "Power supply device '{}' does not exist",
-                    device_path.to_string_lossy()
+                    self.device_path.to_string_lossy()
                 ),
             ));
         }
 
-        // Read charge_full exactly once, if it exists.
-        let charge_full = if device_path.join("charge_full").exists() {
+        // Read charge_full exactly once, if it exists, units are µAh
+        self.charge_full = if self.device_path.join("charge_full").exists() {
             Some(
-                read_file("battery", &device_path.join("charge_full"))?
+                read_file("battery", &self.device_path.join("charge_full"))?
                     .parse::<u64>()
                     .block_error("battery", "failed to parse charge_full")?,
             )
@@ -76,10 +114,10 @@ impl PowerSupplyDevice {
             None
         };
 
-        // Read energy_full exactly once, if it exists.
-        let energy_full = if device_path.join("energy_full").exists() {
+        // Read energy_full exactly once, if it exists. Units are µWh.
+        self.energy_full = if self.device_path.join("energy_full").exists() {
             Some(
-                read_file("battery", &device_path.join("energy_full"))?
+                read_file("battery", &self.device_path.join("energy_full"))?
                     .parse::<u64>()
                     .block_error("battery", "failed to parse energy_full")?,
             )
@@ -87,15 +125,9 @@ impl PowerSupplyDevice {
             None
         };
 
-        Ok(PowerSupplyDevice {
-            device_path,
-            charge_full,
-            energy_full,
-        })
+        Ok(())
     }
-}
 
-impl BatteryDevice for PowerSupplyDevice {
     fn status(&self) -> Result<String> {
         read_file("battery", &self.device_path.join("status"))
     }
@@ -136,32 +168,54 @@ impl BatteryDevice for PowerSupplyDevice {
     }
 
     fn time_remaining(&self) -> Result<u64> {
-        let full = if self.energy_full.is_some() {
-            self.energy_full.unwrap()
-        } else if self.charge_full.is_some() {
-            self.charge_full.unwrap()
+        let time_to_empty_now_path = self.device_path.join("time_to_empty_now");
+        let time_to_empty = if time_to_empty_now_path.exists() {
+            read_file("battery", &time_to_empty_now_path)?
+                .parse::<u64>()
+                .block_error("battery", "failed to parse time to empty")
         } else {
-            return Err(BlockError(
+            Err(BlockError(
                 "battery".to_string(),
-                "Device does not support reading energy".to_string(),
-            ));
+                "Device does not support reading time to empty directly".to_string(),
+            ))
+        };
+        let time_to_full_now_path = self.device_path.join("time_to_full_now");
+        let time_to_full = if time_to_full_now_path.exists() {
+            read_file("battery", &time_to_full_now_path)?
+                .parse::<u64>()
+                .block_error("battery", "failed to parse time to full")
+        } else {
+            Err(BlockError(
+                "battery".to_string(),
+                "Device does not support reading time to full directly".to_string(),
+            ))
         };
 
+        // Units are µWh
+        let full = if self.energy_full.is_some() {
+            self.energy_full
+        } else if self.charge_full.is_some() {
+            self.charge_full
+        } else {
+            None
+        };
+
+        // Units are µWh/µAh
         let energy_path = self.device_path.join("energy_now");
         let charge_path = self.device_path.join("charge_now");
         let fill = if energy_path.exists() {
             read_file("battery", &energy_path)?
                 .parse::<f64>()
-                .block_error("battery", "failed to parse energy_now")?
+                .block_error("battery", "failed to parse energy_now")
         } else if charge_path.exists() {
             read_file("battery", &charge_path)?
                 .parse::<f64>()
-                .block_error("battery", "failed to parse charge_now")?
+                .block_error("battery", "failed to parse charge_now")
         } else {
-            return Err(BlockError(
+            Err(BlockError(
                 "battery".to_string(),
                 "Device does not support reading energy".to_string(),
-            ));
+            ))
         };
 
         let power_path = self.device_path.join("power_now");
@@ -169,23 +223,50 @@ impl BatteryDevice for PowerSupplyDevice {
         let usage = if power_path.exists() {
             read_file("battery", &power_path)?
                 .parse::<f64>()
-                .block_error("battery", "failed to parse power_now")?
+                .block_error("battery", "failed to parse power_now")
         } else if current_path.exists() {
             read_file("battery", &current_path)?
                 .parse::<f64>()
-                .block_error("battery", "failed to parse current_now")?
+                .block_error("battery", "failed to parse current_now")
         } else {
-            return Err(BlockError(
+            Err(BlockError(
                 "battery".to_string(),
                 "Device does not support reading power".to_string(),
-            ));
+            ))
         };
 
+        // If the device driver uses the combination of energy_full, energy_now and power_now,
+        // all values (full, fill, and usage) are in Watts, while if it uses charge_full, charge_now
+        // and current_now, they're in Amps. In all 3 equations below the units cancel out and
+        // we're left with a time value.
         let status = self.status()?;
         match status.as_str() {
-            "Full" => Ok(((full as f64 / usage) * 60.0) as u64),
-            "Discharging" => Ok(((fill / usage) * 60.0) as u64),
-            "Charging" => Ok((((full as f64 - fill) / usage) * 60.0) as u64),
+            "Discharging" => {
+                if time_to_empty.is_ok() {
+                    time_to_empty
+                } else if fill.is_ok() && usage.is_ok() {
+                    Ok(((fill.unwrap() / usage.unwrap()) * 60.0) as u64)
+                } else {
+                    Err(BlockError(
+                        "battery".to_string(),
+                        "Device does not support any method of calculating time to empty"
+                            .to_string(),
+                    ))
+                }
+            }
+            "Charging" => {
+                if time_to_full.is_ok() {
+                    time_to_full
+                } else if full.is_some() && fill.is_ok() && usage.is_ok() {
+                    Ok((((full.unwrap() as f64 - fill.unwrap()) / usage.unwrap()) * 60.0) as u64)
+                } else {
+                    Err(BlockError(
+                        "battery".to_string(),
+                        "Device does not support any method of calculating time to full"
+                            .to_string(),
+                    ))
+                }
+            }
             _ => {
                 // TODO: What should we return in this case? It seems that under
                 // some conditions sysfs will return 0 for some readings (energy
@@ -197,12 +278,25 @@ impl BatteryDevice for PowerSupplyDevice {
     }
 
     fn power_consumption(&self) -> Result<u64> {
+        // power consumption in µWh
         let power_path = self.device_path.join("power_now");
+        // current consumption in µA
+        let current_path = self.device_path.join("current_now");
+        // voltage in µV
+        let voltage_path = self.device_path.join("voltage_now");
 
         if power_path.exists() {
             Ok(read_file("battery", &power_path)?
                 .parse::<u64>()
                 .block_error("battery", "failed to parse power_now")?)
+        } else if current_path.exists() && voltage_path.exists() {
+            let current = read_file("battery", &current_path)?
+                .parse::<u64>()
+                .block_error("battery", "failed to parse current_now")?;
+            let voltage = read_file("battery", &voltage_path)?
+                .parse::<u64>()
+                .block_error("battery", "failed to parse voltage_now")?;
+            Ok((current * voltage) / 1_000_000)
         } else {
             Err(BlockError(
                 "battery".to_string(),
@@ -273,41 +367,52 @@ impl UpowerDevice {
     /// via the `update_request` channel.
     pub fn monitor(&self, id: String, update_request: Sender<Task>) {
         let path = self.device_path.clone();
-        thread::spawn(move || {
-            let con = dbus::ffidisp::Connection::get_private(dbus::ffidisp::BusType::System)
-                .expect("Failed to establish D-Bus connection.");
-            let rule = format!(
-                "type='signal',\
+        thread::Builder::new()
+            .name("battery".into())
+            .spawn(move || {
+                let con = dbus::ffidisp::Connection::get_private(dbus::ffidisp::BusType::System)
+                    .expect("Failed to establish D-Bus connection.");
+                let rule = format!(
+                    "type='signal',\
                  path='{}',\
                  interface='org.freedesktop.DBus.Properties',\
                  member='PropertiesChanged'",
-                path
-            );
+                    path
+                );
 
-            // First we're going to get an (irrelevant) NameAcquired event.
-            con.incoming(10_000).next();
+                // First we're going to get an (irrelevant) NameAcquired event.
+                con.incoming(10_000).next();
 
-            con.add_match(&rule)
-                .expect("Failed to add D-Bus match rule.");
+                con.add_match(&rule)
+                    .expect("Failed to add D-Bus match rule.");
 
-            loop {
-                if con.incoming(10_000).next().is_some() {
-                    update_request
-                        .send(Task {
-                            id: id.clone(),
-                            update_time: Instant::now(),
-                        })
-                        .unwrap();
-                    // Avoid update spam.
-                    // TODO: Is this necessary?
-                    thread::sleep(Duration::from_millis(1000))
+                loop {
+                    if con.incoming(10_000).next().is_some() {
+                        update_request
+                            .send(Task {
+                                id: id.clone(),
+                                update_time: Instant::now(),
+                            })
+                            .unwrap();
+                        // Avoid update spam.
+                        // TODO: Is this necessary?
+                        thread::sleep(Duration::from_millis(1000))
+                    }
                 }
-            }
-        });
+            })
+            .unwrap();
     }
 }
 
 impl BatteryDevice for UpowerDevice {
+    fn is_available(&self) -> bool {
+        true // TODO: has to be implemented for UPower
+    }
+
+    fn refresh_device_info(&mut self) -> Result<()> {
+        Ok(())
+    }
+
     fn status(&self) -> Result<String> {
         let status: u32 = self
             .con
@@ -376,7 +481,15 @@ pub struct Battery {
     update_interval: Duration,
     device: Box<dyn BatteryDevice>,
     format: FormatTemplate,
+    full_format: FormatTemplate,
+    missing_format: FormatTemplate,
+    allow_missing: bool,
+    hide_missing: bool,
     driver: BatteryDriver,
+    good: u64,
+    info: u64,
+    warning: u64,
+    critical: u64,
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -417,12 +530,49 @@ pub struct BatteryConfig {
     #[serde(default = "BatteryConfig::default_format")]
     pub format: String,
 
+    /// Format string for displaying battery information when battery is full.
+    /// placeholders: {percentage}, {bar}, {time} and {power}
+    #[serde(default = "BatteryConfig::default_full_format")]
+    pub full_format: String,
+
+    /// Format string that's displayed if a battery is missing.
+    /// placeholders: {percentage}, {bar}, {time} and {power}
+    #[serde(default = "BatteryConfig::default_missing_format")]
+    pub missing_format: String,
+
     /// (DEPRECATED) Use UPower to monitor battery status and events.
     #[serde(default = "BatteryConfig::default_upower")]
     pub upower: bool,
 
     /// The "driver" to use for powering the block. One of "sysfs" or "upower".
     pub driver: Option<BatteryDriver>,
+
+    /// The threshold above which the remaining capacity is shown as good
+    #[serde(default = "BatteryConfig::default_good")]
+    pub good: u64,
+
+    /// The threshold below which the remaining capacity is shown as info
+    #[serde(default = "BatteryConfig::default_info")]
+    pub info: u64,
+
+    /// The threshold below which the remaining capacity is shown as warning
+    #[serde(default = "BatteryConfig::default_warning")]
+    pub warning: u64,
+
+    /// The threshold below which the remaining capacity is shown as critical
+    #[serde(default = "BatteryConfig::default_critical")]
+    pub critical: u64,
+
+    /// If the battery device cannot be found, do not fail and show the block anyway (sysfs only).
+    #[serde(default = "BatteryConfig::default_allow_missing")]
+    pub allow_missing: bool,
+
+    /// If the battery device cannot be found, completely hide this block.
+    #[serde(default = "BatteryConfig::default_hide_missing")]
+    pub hide_missing: bool,
+
+    #[serde(default = "BatteryConfig::default_color_overrides")]
+    pub color_overrides: Option<BTreeMap<String, String>>,
 }
 
 impl BatteryConfig {
@@ -438,8 +588,44 @@ impl BatteryConfig {
         "{percentage}%".into()
     }
 
+    fn default_full_format() -> String {
+        "".into()
+    }
+
+    fn default_missing_format() -> String {
+        "{percentage}%".into()
+    }
+
     fn default_upower() -> bool {
         false
+    }
+
+    fn default_critical() -> u64 {
+        15
+    }
+
+    fn default_warning() -> u64 {
+        30
+    }
+
+    fn default_info() -> u64 {
+        60
+    }
+
+    fn default_good() -> u64 {
+        60
+    }
+
+    fn default_allow_missing() -> bool {
+        false
+    }
+
+    fn default_hide_missing() -> bool {
+        false
+    }
+
+    fn default_color_overrides() -> Option<BTreeMap<String, String>> {
+        None
     }
 }
 
@@ -471,14 +657,17 @@ impl ConfigBlock for Battery {
             _ => BatteryDriver::Sysfs,
         };
 
-        let id = Uuid::new_v4().to_simple().to_string();
+        let id = pseudo_uuid();
         let device: Box<dyn BatteryDevice> = match driver {
             BatteryDriver::Upower => {
                 let out = UpowerDevice::from_device(&block_config.device)?;
                 out.monitor(id.clone(), update_request);
                 Box::new(out)
             }
-            BatteryDriver::Sysfs => Box::new(PowerSupplyDevice::from_device(&block_config.device)?),
+            BatteryDriver::Sysfs => Box::new(PowerSupplyDevice::from_device(
+                &block_config.device,
+                block_config.allow_missing,
+            )?),
         };
 
         Ok(Battery {
@@ -487,43 +676,85 @@ impl ConfigBlock for Battery {
             output: TextWidget::new(config),
             device,
             format: FormatTemplate::from_string(&format)?,
+            full_format: FormatTemplate::from_string(&block_config.full_format)?,
+            missing_format: FormatTemplate::from_string(&block_config.missing_format)?,
+            allow_missing: block_config.allow_missing,
+            hide_missing: block_config.hide_missing,
             driver,
+            good: block_config.good,
+            info: block_config.info,
+            warning: block_config.warning,
+            critical: block_config.critical,
         })
     }
 }
 
 impl Block for Battery {
-    fn update(&mut self) -> Result<Option<Duration>> {
+    fn update(&mut self) -> Result<Option<Update>> {
         // TODO: Maybe use dbus to immediately signal when the battery state changes.
 
+        // Exit early, if the battery device went missing, but the user
+        // allows this device to go missing.
+        if !self.device.is_available() && self.allow_missing {
+            // Respect the original format string, even if the battery
+            // cannot be found right now.
+            let empty_percent_bar = format_percent_bar(0.0);
+            let values = map!(
+                "{percentage}" => "X",
+                "{bar}" => &empty_percent_bar,
+                "{time}" => "xx:xx",
+                "{power}" => "N/A"
+            );
+
+            self.output.set_icon("bat_not_available");
+            self.output
+                .set_text(self.missing_format.render_static_str(&values)?);
+            self.output.set_state(State::Warning);
+
+            return match self.driver {
+                BatteryDriver::Sysfs => Ok(Some(Update::Every(self.update_interval))),
+                BatteryDriver::Upower => Ok(None),
+            };
+        }
+
+        // The device may have gone missing
+        // It may be a different battery now, thereby refresh the device specs.
+        self.device.refresh_device_info()?;
+
         let status = self.device.status()?;
+        let capacity = self.device.capacity();
+        let percentage = match capacity {
+            Ok(capacity) => format!("{}", capacity),
+            Err(_) => "×".into(),
+        };
+        let bar = match capacity {
+            Ok(capacity) => format_percent_bar(capacity as f32),
+            Err(_) => "×".into(),
+        };
+        let time = match self.device.time_remaining() {
+            Ok(time) => match time {
+                0 => "".into(),
+                _ => format!("{}:{:02}", std::cmp::min(time / 60, 99), time % 60),
+            },
+            Err(_) => "×".into(),
+        };
+        // convert µW to W for display
+        let power = match self.device.power_consumption() {
+            Ok(power) => format!("{:.2}", power as f64 / 1000.0 / 1000.0),
+            Err(_) => "×".into(),
+        };
+        let values = map!("{percentage}" => percentage,
+                            "{bar}" => bar,
+                            "{time}" => time,
+                            "{power}" => power);
 
         if status == "Full" || status == "Not charging" {
             self.output.set_icon("bat_full");
-            self.output.set_text("".to_string());
+            self.output
+                .set_text(self.full_format.render_static_str(&values)?);
             self.output.set_state(State::Good);
+            self.output.set_spacing(Spacing::Hidden);
         } else {
-            let capacity = self.device.capacity();
-            let percentage = match capacity {
-                Ok(capacity) => format!("{}", capacity),
-                Err(_) => "×".into(),
-            };
-            let bar = match capacity {
-                Ok(capacity) => format_percent_bar(capacity as f32),
-                Err(_) => "×".into(),
-            };
-            let time = match self.device.time_remaining() {
-                Ok(time) => format!("{}:{:02}", time / 60, time % 60),
-                Err(_) => "×".into(),
-            };
-            let power = match self.device.power_consumption() {
-                Ok(power) => format!("{:.2}", power as f64 / 1000.0 / 1000.0),
-                Err(_) => "×".into(),
-            };
-            let values = map!("{percentage}" => percentage,
-                              "{bar}" => bar,
-                              "{time}" => time,
-                              "{power}" => power);
             self.output
                 .set_text(self.format.render_static_str(&values)?);
 
@@ -535,42 +766,48 @@ impl Block for Battery {
                 }
                 _ => {
                     self.output.set_state(match capacity {
-                        Ok(0..=15) => State::Critical,
-                        Ok(16..=30) => State::Warning,
-                        Ok(31..=60) => State::Info,
-                        Ok(61..=100) => State::Good,
-                        _ => State::Warning,
+                        Ok(capacity) => {
+                            if capacity <= self.critical {
+                                State::Critical
+                            } else if capacity <= self.warning {
+                                State::Warning
+                            } else if capacity <= self.info {
+                                State::Info
+                            } else if capacity > self.good {
+                                State::Good
+                            } else {
+                                State::Idle
+                            }
+                        }
+                        Err(_) => State::Warning,
                     });
                 }
             }
 
             self.output.set_icon(match status.as_str() {
-                "Discharging" => capacity_to_icon(capacity),
+                "Discharging" => battery_level_to_icon(capacity),
                 "Charging" => "bat_charging",
-                _ => capacity_to_icon(capacity),
+                _ => battery_level_to_icon(capacity),
             });
+            self.output.set_spacing(Spacing::Normal);
         }
 
         match self.driver {
-            BatteryDriver::Sysfs => Ok(Some(self.update_interval)),
+            BatteryDriver::Sysfs => Ok(Some(self.update_interval.into())),
             BatteryDriver::Upower => Ok(None),
         }
     }
 
     fn view(&self) -> Vec<&dyn I3BarWidget> {
+        // Don't display the block at all, if it's configured to be hidden on missing batteries
+        if !self.device.is_available() && self.hide_missing {
+            return Vec::new();
+        }
+
         vec![&self.output]
     }
 
     fn id(&self) -> &str {
         &self.id
-    }
-}
-
-fn capacity_to_icon(cap: Result<u64>) -> &'static str {
-    match cap {
-        Ok(0..=25) => "bat_quarter",
-        Ok(26..=50) => "bat_half",
-        Ok(51..=75) => "bat_three_quarters",
-        _ => "bat_full",
     }
 }

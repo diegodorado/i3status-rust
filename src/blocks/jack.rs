@@ -9,8 +9,9 @@ use std::io::Read;
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
+use std::collections::BTreeMap;
 
-use crate::blocks::{Block, ConfigBlock};
+use crate::blocks::{Block, ConfigBlock, Update};
 use crate::config::{Config};
 use crate::errors::*;
 use crate::scheduler::Task;
@@ -250,6 +251,9 @@ pub struct SoundConfig {
     #[serde(default = "SoundConfig::default_show_volume_when_muted")]
     pub show_volume_when_muted: bool,
 
+    #[serde(default = "SoundConfig::default_color_overrides")]
+    pub color_overrides: Option<BTreeMap<String, String>>,
+
 }
 
 #[derive(Deserialize, Copy, Clone, Debug)]
@@ -272,6 +276,10 @@ impl SoundConfig {
     fn default_show_volume_when_muted() -> bool {
         false
     }
+    fn default_color_overrides() -> Option<BTreeMap<String, String>> {
+        None
+    }
+
 }
 
 impl Jack {
@@ -356,7 +364,7 @@ const PLAY_ICON: &'static str = "  ";
 const STOP_ICON: &'static str = "  ";
 
 impl Block for Jack {
-    fn update(&mut self) -> Result<Option<Duration>> {
+    fn update(&mut self) -> Result<Option<Update>> {
         self.display()?;
         Ok(None) // The monitor thread will call for updates when needed.
     }

@@ -1,21 +1,19 @@
-use serde_derive::Deserialize;
+use std::collections::BTreeMap;
+use std::fs::{read_to_string, OpenOptions};
+use std::io::prelude::*;
 use std::time::Duration;
 
-use crate::blocks::{Block, ConfigBlock};
+use crossbeam_channel::Sender;
+use serde_derive::Deserialize;
+
+use crate::blocks::{Block, ConfigBlock, Update};
 use crate::config::Config;
 use crate::de::deserialize_duration;
 use crate::errors::*;
 use crate::scheduler::Task;
-use crate::util::FormatTemplate;
+use crate::util::{pseudo_uuid, FormatTemplate};
 use crate::widget::{I3BarWidget, State};
 use crate::widgets::text::TextWidget;
-use crossbeam_channel::Sender;
-
-use std::fs::{File, OpenOptions};
-use std::io::prelude::*;
-use std::io::BufReader;
-
-use uuid::Uuid;
 
 pub struct Load {
     text: TextWidget,
@@ -50,6 +48,9 @@ pub struct LoadConfig {
     /// Minimum load, where state is set to critical
     #[serde(default = "LoadConfig::default_critical")]
     pub critical: f32,
+
+    #[serde(default = "LoadConfig::default_color_overrides")]
+    pub color_overrides: Option<BTreeMap<String, String>>,
 }
 
 impl LoadConfig {
@@ -72,6 +73,10 @@ impl LoadConfig {
     fn default_critical() -> f32 {
         0.9
     }
+
+    fn default_color_overrides() -> Option<BTreeMap<String, String>> {
+        None
+    }
 }
 
 impl ConfigBlock for Load {
@@ -86,25 +91,16 @@ impl ConfigBlock for Load {
             .with_icon("cogs")
             .with_state(State::Info);
 
-        let f = File::open("/proc/cpuinfo")
+        // borrowed from https://docs.rs/cpuinfo/0.1.1/src/cpuinfo/count/logical.rs.html#4-6
+        let content = read_to_string("/proc/cpuinfo")
             .block_error("load", "Your system doesn't support /proc/cpuinfo")?;
-        let f = BufReader::new(f);
-
-        let mut logical_cores = 0;
-
-        for line in f.lines().scan((), |_, x| x.ok()) {
-            // TODO: Does this value always represent the correct number of logical cores?
-            if line.starts_with("siblings") {
-                let split: Vec<&str> = (&line).split(' ').collect();
-                logical_cores = split[1]
-                    .parse::<u32>()
-                    .block_error("load", "Invalid Cpu info format!")?;
-                break;
-            }
-        }
+        let logical_cores = content
+            .lines()
+            .filter(|l| l.starts_with("processor"))
+            .count() as u32;
 
         Ok(Load {
-            id: Uuid::new_v4().to_simple().to_string(),
+            id: pseudo_uuid(),
             logical_cores,
             update_interval: block_config.interval,
             minimum_info: block_config.info,
@@ -118,7 +114,7 @@ impl ConfigBlock for Load {
 }
 
 impl Block for Load {
-    fn update(&mut self) -> Result<Option<Duration>> {
+    fn update(&mut self) -> Result<Option<Update>> {
         let mut f = OpenOptions::new()
             .read(true)
             .open("/proc/loadavg")
@@ -150,7 +146,7 @@ impl Block for Load {
 
         self.text.set_text(self.format.render_static_str(&values)?);
 
-        Ok(Some(self.update_interval))
+        Ok(Some(self.update_interval.into()))
     }
 
     fn view(&self) -> Vec<&dyn I3BarWidget> {

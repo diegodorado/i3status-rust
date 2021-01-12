@@ -1,44 +1,51 @@
-use crate::de::deserialize_duration;
-use crossbeam_channel::Sender;
-use serde_derive::Deserialize;
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
-use crate::blocks::{Block, ConfigBlock};
+use crossbeam_channel::Sender;
+use serde_derive::Deserialize;
+use swayipc::reply::{Event, Node, WindowChange, WorkspaceChange};
+use swayipc::{Connection, EventType};
+
+use crate::blocks::{Block, ConfigBlock, Update};
 use crate::config::Config;
 use crate::errors::*;
 use crate::scheduler::Task;
+use crate::util::pseudo_uuid;
 use crate::widget::I3BarWidget;
 use crate::widgets::text::TextWidget;
 
-use uuid::Uuid;
-
-use i3ipc::event::inner::{WindowChange, WorkspaceChange};
-use i3ipc::event::Event;
-use i3ipc::I3EventListener;
-use i3ipc::Subscription;
+#[derive(Copy, Clone, Debug, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MarksType {
+    All,
+    Visible,
+    None,
+}
 
 pub struct FocusedWindow {
     text: TextWidget,
     title: Arc<Mutex<String>>,
+    marks: Arc<Mutex<String>>,
+    show_marks: MarksType,
     max_width: usize,
     id: String,
-    update_interval: Duration,
 }
 
-#[derive(Deserialize, Debug, Default, Clone)]
+#[derive(Deserialize, Debug, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct FocusedWindowConfig {
     /// Truncates titles if longer than max-width
     #[serde(default = "FocusedWindowConfig::default_max_width")]
     pub max_width: usize,
 
-    #[serde(
-        default = "FocusedWindowConfig::default_interval",
-        deserialize_with = "deserialize_duration"
-    )]
-    pub interval: Duration,
+    /// Show marks in place of title (if exist)
+    #[serde(default = "FocusedWindowConfig::default_show_marks")]
+    pub show_marks: MarksType,
+
+    #[serde(default = "FocusedWindowConfig::default_color_overrides")]
+    pub color_overrides: Option<BTreeMap<String, String>>,
 }
 
 impl FocusedWindowConfig {
@@ -46,8 +53,12 @@ impl FocusedWindowConfig {
         21
     }
 
-    fn default_interval() -> Duration {
-        Duration::from_secs(30)
+    fn default_show_marks() -> MarksType {
+        MarksType::None
+    }
+
+    fn default_color_overrides() -> Option<BTreeMap<String, String>> {
+        None
     }
 }
 
@@ -55,109 +66,173 @@ impl ConfigBlock for FocusedWindow {
     type Config = FocusedWindowConfig;
 
     fn new(block_config: Self::Config, config: Config, tx: Sender<Task>) -> Result<Self> {
-        let id = Uuid::new_v4().to_simple().to_string();
+        let id = pseudo_uuid();
         let id_clone = id.clone();
 
-        let title_original = Arc::new(Mutex::new(String::from("")));
-        let title = title_original.clone();
+        let title = Arc::new(Mutex::new(String::from("")));
+        let marks = Arc::new(Mutex::new(String::from("")));
+        let marks_type = block_config.show_marks;
 
-        let _test_conn = I3EventListener::connect()
-            .block_error("focused_window", "failed to acquire connect to IPC")?;
+        let update_window = {
+            let title = title.clone();
 
-        thread::spawn(move || {
-            // establish connection.
-            let mut listener = I3EventListener::connect().unwrap();
+            move |new_title| {
+                let mut title = title
+                    .lock()
+                    .expect("lock has been poisoned in `window` block");
 
-            // subscribe to a couple events.
-            let subs = [Subscription::Window, Subscription::Workspace];
-            listener.subscribe(&subs).unwrap();
+                let changed = *title != new_title;
+                *title = new_title;
+                changed
+            }
+        };
 
-            // handle them
-            for event in listener.listen() {
-                match event.unwrap() {
-                    Event::WindowEvent(e) => {
-                        match e.change {
-                            WindowChange::Focus => {
-                                if let Some(name) = e.container.name {
-                                    let mut title = title_original.lock().unwrap();
-                                    *title = name;
-                                    tx.send(Task {
-                                        id: id_clone.clone(),
-                                        update_time: Instant::now(),
-                                    })
-                                    .unwrap();
-                                }
-                            }
-                            WindowChange::Title => {
-                                if e.container.focused {
-                                    if let Some(name) = e.container.name {
-                                        let mut title = title_original.lock().unwrap();
-                                        *title = name;
-                                        tx.send(Task {
-                                            id: id_clone.clone(),
-                                            update_time: Instant::now(),
-                                        })
-                                        .unwrap();
-                                    }
-                                }
-                            }
-                            WindowChange::Close => {
-                                if let Some(name) = e.container.name {
-                                    let mut title = title_original.lock().unwrap();
-                                    if name == *title {
-                                        *title = String::from("");
-                                        tx.send(Task {
-                                            id: id_clone.clone(),
-                                            update_time: Instant::now(),
-                                        })
-                                        .unwrap();
-                                    }
-                                }
-                            }
-                            _ => {}
-                        };
-                    }
-                    Event::WorkspaceEvent(e) => {
-                        if let WorkspaceChange::Init = e.change {
-                            let mut title = title_original.lock().unwrap();
-                            *title = String::from("");
-                            tx.send(Task {
-                                id: id_clone.clone(),
-                                update_time: Instant::now(),
-                            })
-                            .unwrap();
-                        }
-                    }
-                    _ => unreachable!(),
+        let close_window = {
+            let title = title.clone();
+
+            move |closed_title: String| {
+                let mut title = title
+                    .lock()
+                    .expect("lock has been poisoned in `window` block");
+
+                if *title == closed_title {
+                    *title = "".to_string();
+                    true
+                } else {
+                    false
                 }
             }
-        });
+        };
+
+        let update_marks = {
+            let marks = marks.clone();
+
+            move |new_marks: Vec<String>| {
+                let mut new_marks_str = String::from("");
+
+                for mark in new_marks {
+                    match marks_type {
+                        MarksType::All => {
+                            new_marks_str.push_str(&format!("[{}]", mark));
+                        }
+                        MarksType::Visible if !mark.starts_with('_') => {
+                            new_marks_str.push_str(&format!("[{}]", mark));
+                        }
+                        _ => {}
+                    }
+                }
+
+                let mut marks = marks
+                    .lock()
+                    .expect("lock has been poisoned in `window` block");
+
+                let changed = *marks != new_marks_str;
+                *marks = new_marks_str;
+                changed
+            }
+        };
+
+        let _test_conn =
+            Connection::new().block_error("focused_window", "failed to acquire connect to IPC")?;
+
+        thread::Builder::new()
+            .name("focused_window".into())
+            .spawn(move || {
+                let conn = Connection::new().expect("failed to open connection with swayipc");
+
+                let events = conn
+                    .subscribe(&[EventType::Window, EventType::Workspace])
+                    .expect("could not subscribe to window events");
+
+                for event in events {
+                    let updated = match event.expect("could not read event in `window` block") {
+                        Event::Window(e) => match (e.change, e.container) {
+                            (WindowChange::Mark, Node { marks, .. }) => update_marks(marks),
+                            (WindowChange::Focus, Node { name, marks, .. }) => {
+                                let updated_for_window = name.map(&update_window).unwrap_or(false);
+                                let updated_for_marks = update_marks(marks);
+                                updated_for_window || updated_for_marks
+                            }
+                            (
+                                WindowChange::Title,
+                                Node {
+                                    focused: true,
+                                    name: Some(name),
+                                    ..
+                                },
+                            ) => update_window(name),
+                            (
+                                WindowChange::Close,
+                                Node {
+                                    name: Some(name), ..
+                                },
+                            ) => close_window(name),
+                            _ => false,
+                        },
+                        Event::Workspace(e) if e.change == WorkspaceChange::Init => {
+                            update_window("".to_string())
+                        }
+                        _ => false,
+                    };
+
+                    if updated {
+                        tx.send(Task {
+                            id: id_clone.clone(),
+                            update_time: Instant::now(),
+                        })
+                        .expect("could not communicate with channel in `window` block");
+                    }
+                }
+            })
+            .expect("failed to start watching thread for `window` block");
 
         Ok(FocusedWindow {
             id,
             text: TextWidget::new(config),
             max_width: block_config.max_width,
+            show_marks: block_config.show_marks,
             title,
-            update_interval: block_config.interval,
+            marks,
         })
     }
 }
 
 impl Block for FocusedWindow {
-    fn update(&mut self) -> Result<Option<Duration>> {
-        let mut string = (*self
+    fn update(&mut self) -> Result<Option<Update>> {
+        let mut marks_string = (*self
+            .marks
+            .lock()
+            .block_error("focused_window", "failed to acquire lock")?)
+        .clone();
+        marks_string = marks_string.chars().take(self.max_width).collect();
+        let mut title_string = (*self
             .title
             .lock()
             .block_error("focused_window", "failed to acquire lock")?)
         .clone();
-        string = string.chars().take(self.max_width).collect();
-        self.text.set_text(string);
-        Ok(Some(self.update_interval))
+        title_string = title_string.chars().take(self.max_width).collect();
+        let out_str = match self.show_marks {
+            MarksType::None => title_string,
+            _ => {
+                if !marks_string.is_empty() {
+                    marks_string
+                } else {
+                    title_string
+                }
+            }
+        };
+        self.text.set_text(out_str);
+
+        Ok(None)
     }
 
     fn view(&self) -> Vec<&dyn I3BarWidget> {
-        let title = &*self.title.lock().unwrap();
-        if String::is_empty(title) {
+        let title = &*self
+            .title
+            .lock()
+            .expect("lock has been poisoned in `window` block");
+
+        if title.is_empty() {
             vec![]
         } else {
             vec![&self.text]
